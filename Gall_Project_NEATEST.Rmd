@@ -1,0 +1,1652 @@
+---
+title: "Gall_Project_NEATEST"
+author: "Christopher Bivins"
+date: "2024-09-30"
+output: html_document
+---
+
+#### Packages
+```{r}
+install.packages("dunn.test")
+install.packages("ggpubr")
+install.packages("ggsignif")
+install.packages("VennDiagram")
+install.packages("reshape2")
+install.packages("RColorBrewer")
+install.packages("viridis")
+install.packages("phyloseq")
+```
+
+```{r}
+library(dunn.test)
+library(gridExtra)
+library(grid)
+library(VennDiagram)
+library(reshape2)
+library(RColorBrewer)
+library(phyloseq)
+library(vegan)
+library(FSA)
+library(dplyr)
+library(betapart)
+library(indicspecies)
+library(tibble)
+library(DESeq2)
+library(tidyr)
+library(ggplot2)
+```
+
+## Data Preparation
+
+### Import the BIOM file that is the final output of AMPtk
+
+```{r}
+endophytes_physeq <- import_biom("/Users/christopherbivins/Desktop/AMPTK_Outputs/Endophytes_Project/taxonomyITS.biom")
+# Extract OTU table as a data frame
+otu_df <- as.data.frame(otu_table(endophytes_physeq))
+```
+
+### Check if any samples have all zero sequence counts for all OTUs
+```{r}
+# Extract the OTU table from endophytes_physeq
+otu_table_endophytes <- otu_table(endophytes_physeq)
+
+# Find samples with all zero counts
+zero_count_samples <- colnames(otu_table_endophytes)[colSums(otu_table_endophytes) == 0]
+
+# Print the results
+if (length(zero_count_samples) > 0) {
+  cat("Samples with all zero counts:\n")
+  print(zero_count_samples)
+} else {
+  cat("No samples with all zero counts found.\n")
+}
+
+```
+
+#### Sample O1-G-5-S164-L001 has no sequence counts for any OTU whatsoever. This is a problem
+
+### Perform negative control filtering 
+(Note: For now, I am just going to rely on my PCR negative control. I have three other negative controls that I will come back to when I understand better what to do with them. One is a blank DNA extraction negative control, another is a blank tube that was put in the lyophilizer when I lyophilized the samples for this project, and the last negative control sample is from the buffer wash solution I used to surface sterilize leaves/galls)
+
+```{r}
+# Identify the negative control samples
+neg_samples <- grep("NEG", colnames(otu_df), value = TRUE)
+# Compute the total count of each OTU across the negative control samples
+neg_counts <- rowSums(otu_df[neg_samples])
+# Iterate over each OTU found in the negative controls
+for (otu in names(neg_counts)) {
+  # Check if the OTU is in the sample data
+  if (otu %in% rownames(otu_df)) {
+    # Subtract the negative control counts from the sample counts, ensuring no negative values
+    otu_df[otu,] <- pmax(otu_df[otu,] - neg_counts[otu], 0)
+  }
+}
+# Convert the adjusted DataFrame back to a phyloseq OTU table
+otu_table_adj <- otu_table(otu_df, taxa_are_rows = TRUE)
+# Create the new adjusted phyloseq object without phylogenetic tree
+physeq_adj <- phyloseq(otu_table_adj, sample_data(endophytes_physeq), tax_table(endophytes_physeq))
+# Change the name of physeq_adj to amptk_filtered_nc for downstream analysis
+endophytes_amptk_filtered_nc <- physeq_adj
+# Remove Negative Control Samples
+# Define a vector of sample names to be removed
+samples_to_remove <- c("NEG-CONTROL-N-S241-L001", "NEG-CONTROL-R-S242-L001", 
+                       "BLANK-R-S243-L001", "WASH-JULY-S224-L001", "WASH-MAY-S223-L001", 
+                       "WASH-SEP-S225-L001", "LYOPH-JULY-S221-L001", "LYOPH-MAY-S220-L001", 
+                       "LYOPH-SEP-S222-L001")
+# Reinitialize phyloseq object without negative control samples
+endophytes_amptk_filtered_nc <- subset_samples(endophytes_amptk_filtered_nc, !sample_names(endophytes_amptk_filtered_nc) %in% samples_to_remove)
+# Verify that the negative control filtering worked:
+# Extract count for a specific OTU in a specific sample from the original physeq
+otu_count_physeq <- otu_table(endophytes_physeq)["OTU5", "BOR-1-MAY-S25-L001"]
+print(paste("Count in original physeq: ", otu_count_physeq))
+# Extract count for the same OTU in the same sample from the adjusted physeq
+otu_count_physeq_adj <- otu_table(endophytes_amptk_filtered_nc)["OTU5", "BOR-1-MAY-S25-L001"]
+print(paste("Count in adjusted physeq: ", otu_count_physeq_adj))
+# Convert the filtered Sample table to a data.frame
+endophytes_filtered_sample_df <- as.data.frame(sample_data(endophytes_amptk_filtered_nc))
+
+```
+
+### Assign Functional/Ecological Guild Traits
+
+```{r}
+## Within the biom_data file, the "tax_table" that contains all the taxonomic information is incorrectly formated. The column names for different taxonomic levels are "Rank1", "Rank2", "Rank3", etc., when they really should be "kingdom", "phylum", "class", etc... I need to rename these columns appropriately so that the guild assignment step recognizes the required taxonomic headers. 
+rank_names(endophytes_amptk_filtered_nc)
+colnames(tax_table(endophytes_amptk_filtered_nc)) = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+rank_names(endophytes_amptk_filtered_nc)
+# Clean up the names in the taxonomy table - get rid of all that junk!
+tax_table(endophytes_amptk_filtered_nc)
+tax_table(endophytes_amptk_filtered_nc)[, colnames(tax_table(endophytes_amptk_filtered_nc))] <- gsub(tax_table(endophytes_amptk_filtered_nc)[, colnames(tax_table(endophytes_amptk_filtered_nc))], pattern = "[a-z]__", replacement = "")
+tax_table(endophytes_amptk_filtered_nc)
+# Guild assignment function 
+assign_guild <- function(object, database) { 
+  ### This function assigns trophic modes (and other traits) to OTUs based on taxonomy
+  # returning a table with taxonomy and guild/traits for each OTU 
+  ### Arguments:
+  # object: a phyloseq object, for example imported from a .biom file
+  # database: Reference used, for example FungalTraits (Polme et al. 2020, Fungal Diversity 105, 1-16).
+  ### Function:
+  # load required packages 
+  require(file2meco)
+  require(microeco)
+  # convert phyloseq object into a "microtable"
+  meco <- phyloseq2meco(object)
+  # verify that OTUs and samples information is consistent across files
+  meco$tidy_dataset()
+  # assign guilds
+  t1 <- trans_func$new(dataset = meco)
+  t1$for_what <- "fungi"
+  t1$cal_spe_func(fungi_database = database)
+  # create a dataframe with taxonomy and guild/traits information
+  as.data.frame(t1$res_spe_func_raw_FungalTraits)
+}
+# Assign guilds to OTUs
+# I'm getting an error message saying "Error in if (any(apply(otu_table, 1, sum) == 0)) { :
+# I need to first investigate what values have either NA or NaN before I remove them (or change them to zeros), as will likely need to be done in order to assign guilds 
+# Check for NA values in the OTU table
+any(is.na(otu_table(endophytes_amptk_filtered_nc)))
+# Convert the OTU table to a matrix
+otu_matrix <- as.matrix(otu_table(endophytes_amptk_filtered_nc))
+# Find the indices of NA values
+na_indices <- which(is.na(otu_matrix), arr.ind = TRUE)
+# Print the indices
+print(na_indices)
+# Ah, the Negative control samples (NEG1-4) have all been changed to NaN - we just need to convert these to zeroes
+# Get the OTU table
+otu_table <- otu_table(endophytes_amptk_filtered_nc)
+# Replace NaN values with 0
+otu_table[is.nan(otu_table)] <- 0
+# Assign the modified otu_table back to the phyloseq object
+otu_table(endophytes_amptk_filtered_nc) <- otu_table
+# Assign guilds to the entire dataset
+guild_table = assign_guild(object = endophytes_amptk_filtered_nc, database = "FungalTraits")
+
+```
+
+### Export guild table for plotting with other programs
+```{r}
+# Define the directory where you want to save the CSV file
+output_directory <- "/Users/christopherbivins/Desktop/csv_files_for_galls_graphs/"
+
+# Ensure the directory exists
+if (!dir.exists(output_directory)) {
+  dir.create(output_directory, recursive = TRUE)
+}
+
+# Define the file path for the guild table
+guild_table_file_path <- file.path(output_directory, "guild_table.csv")
+
+# Write the guild table to a CSV file
+write.csv(guild_table, file = guild_table_file_path, row.names = TRUE)
+
+# Print a message indicating the file was saved
+cat("Guild table saved to:", guild_table_file_path, "\n")
+
+```
+
+
+### Subset out Gall samples
+
+```{r}
+# Define the sample name prefixes from gall project
+galls_prefixes <- c("O1", "O2", "O3")
+# Function to create a logical vector indicating which samples to keep based on prefixes
+filter_samples_by_prefix <- function(sample_names, prefixes) {
+  sapply(sample_names, function(name) any(sapply(prefixes, function(prefix) startsWith(name, prefix))))
+}
+# Subset samples for galls_project_physeq
+galls_samples <- sample_names(endophytes_amptk_filtered_nc)[filter_samples_by_prefix(sample_names(endophytes_amptk_filtered_nc), galls_prefixes)]
+galls_project_physeq <- prune_samples(galls_samples, endophytes_amptk_filtered_nc)
+# Verify the subset
+print(sample_names(galls_project_physeq))
+```
+
+
+### Remove the samples with "-R-" in their name - these are the replicate samples that were done with Regular PCR - everything else was made with nested PCR 
+
+```{r}
+# Function to remove samples with "-R-" in their name
+remove_r_samples <- function(physeq) {
+  samples_to_keep <- sample_names(physeq)[!grepl("-R-", sample_names(physeq))]
+  physeq_filtered <- prune_samples(samples_to_keep, physeq)
+  return(physeq_filtered)
+}
+# Apply the function to galls_project_physeq
+galls_project_physeq <- remove_r_samples(galls_project_physeq)
+# Verify the results by printing the sample names
+print(sample_names(galls_project_physeq))
+```
+
+### Print the number of OTUs that have a sequence count greater than 0 for every sample in galls_project_physeq
+```{r}
+# Extract the OTU table from galls_project_physeq
+otu_table_galls <- otu_table(galls_project_physeq)
+
+# Calculate the number of OTUs with sequence counts greater than 0 for each sample
+num_non_zero_otus <- colSums(otu_table_galls > 0)
+
+# Print the number of non-zero OTUs for each sample
+cat("Number of OTUs with sequence counts greater than 0 for each sample:\n")
+print(num_non_zero_otus)
+
+```
+
+### Add sample metadata and create a new phyloseq object. I have a file that contains metadata information for all samples in the following location:
+/Users/christopherbivins/Desktop/Gall_project_metadata.csv
+```{r}
+metadata <- read.csv("/Users/christopherbivins/Desktop/Gall_project_metadata.csv", row.names = 1)
+sample_data <- sample_data(metadata)
+
+# Remove the existing Treatment column from the phyloseq object, if it exists
+existing_data <- sample_data(galls_project_physeq)
+existing_data$Treatment <- NULL
+sample_data(galls_project_physeq) <- existing_data
+
+# Now merge with the new metadata
+galls_project_physeq_updated <- merge_phyloseq(galls_project_physeq, sample_data(metadata))
+
+
+
+```
+
+### Check to see if zero-count OTUs have zeroes or ones
+```{r}
+# Extract OTU counts for O1-G-5-S164-L001 from the original phyloseq object
+original_counts_O1_G_5 <- otu_table(galls_project_physeq_updated)[, "O1-G-5-S164-L001"]
+# Print the OTU counts for O1-G-5-S164-L001
+cat("Original OTU counts for O1-G-5-S164-L001:\n")
+print(original_counts_O1_G_5)
+```
+
+
+### Create data objects for future use. It will be useful to define the sample names for different sample-pairs. By sample pairs, I mean pairing each individual gall sample with the leaf that it came from. It will also be useful to define what samples are ungalled leaves
+
+```{r}
+
+
+# Define sample pairs for Cynips and Andricus galls
+cynips_sample_pairs <- data.frame(
+  SampleName_Gall = c("O1-CQ1-S205-L001", "O1-CQ2-S206-L001", "O1-CQ3-S207-L001", "O1-CQ4-S208-L001", "O1-CQ5-S209-L001",
+                      "O2-CQ1-S210-L001", "O2-CQ2-S211-L001", "O2-CQ3-S212-L001", "O2-CQ4-S213-L001", "O2-CQ5-S214-L001",
+                      "O3-CQ1-S215-L001", "O3-CQ2-S216-L001", "O3-CQ3-S217-L001", "O3-CQ4-S218-L001", "O3-CQ5-S219-L001"),
+  SampleName_Leaf = c("O1-CQ1-GPOS-S175-L001", "O1-CQ2-GPOS-S176-L001", "O1-CQ3-GPOS-S177-L001", "O1-CQ4-GPOS-S178-L001", "O1-CQ5-GPOS-S179-L001",
+                      "O2-CQ1-GPOS-S180-L001", "O2-CQ2-GPOS-S181-L001", "O2-CQ3-GPOS-S182-L001", "O2-CQ4-GPOS-S183-L001", "O2-CQ5-GPOS-S184-L001",
+                      "O3-CQ1-GPOS-S185-L001", "O3-CQ2-GPOS-S186-L001", "O3-CQ3-GPOS-S187-L001", "O3-CQ4-GPOS-S188-L001", "O3-CQ5-GPOS-S189-L001")
+)
+
+andricus_sample_pairs <- data.frame(
+  SampleName_Gall = c("O1-AG1-S190-L001", "O1-AG2-S191-L001", "O1-AG3-S192-L001", "O1-AG4-S193-L001", "O1-AG5-S194-L001",
+                      "O2-AG1-S195-L001", "O2-AG2-S196-L001", "O2-AG3-S197-L001", "O2-AG4-S198-L001", "O2-AG5-S199-L001",
+                      "O3-AG1-S200-L001", "O3-AG2-S201-L001", "O3-AG3-S202-L001", "O3-AG4-S203-L001"),
+  SampleName_Leaf = c("O1-AG1-GPOS-S145-L001", "O1-AG2-GPOS-S146-L001", "O1-AG3-GPOS-S147-L001", "O1-AG4-GPOS-S148-L001", "O1-AG5-GPOS-S149-L001",
+                      "O2-AG1-GPOS-S150-L001", "O2-AG2-GPOS-S151-L001", "O2-AG3-GPOS-S152-L001", "O2-AG4-GPOS-S153-L001", "O2-AG5-GPOS-S154-L001",
+                      "O3-AG1-GPOS-S155-L001", "O3-AG2-GPOS-S156-L001", "O3-AG3-GPOS-S157-L001", "O3-AG4-GPOS-S158-L001")
+)
+
+# Define Cynips gall samples
+cynips_galls_samples <- c("O1-CQ1-S205-L001", "O1-CQ2-S206-L001", "O1-CQ3-S207-L001", "O1-CQ4-S208-L001", "O1-CQ5-S209-L001",
+                          "O2-CQ1-S210-L001", "O2-CQ2-S211-L001", "O2-CQ3-S212-L001", "O2-CQ4-S213-L001", "O2-CQ5-S214-L001",
+                          "O3-CQ1-S215-L001", "O3-CQ2-S216-L001", "O3-CQ3-S217-L001", "O3-CQ4-S218-L001", "O3-CQ5-S219-L001")
+
+# Define leaves galled by Cynips samples
+leaves_galled_by_cynips_samples <- c("O1-CQ1-GPOS-S175-L001", "O1-CQ2-GPOS-S176-L001", "O1-CQ3-GPOS-S177-L001", "O1-CQ4-GPOS-S178-L001", "O1-CQ5-GPOS-S179-L001",
+                                     "O2-CQ1-GPOS-S180-L001", "O2-CQ2-GPOS-S181-L001", "O2-CQ3-GPOS-S182-L001", "O2-CQ4-GPOS-S183-L001", "O2-CQ5-GPOS-S184-L001",
+                                     "O3-CQ1-GPOS-S185-L001", "O3-CQ2-GPOS-S186-L001", "O3-CQ3-GPOS-S187-L001", "O3-CQ4-GPOS-S188-L001", "O3-CQ5-GPOS-S189-L001")
+
+# Define Andricus gall samples
+andricus_galls_samples <- c("O1-AG1-S190-L001", "O1-AG2-S191-L001", "O1-AG3-S192-L001", "O1-AG4-S193-L001", "O1-AG5-S194-L001",
+                            "O2-AG1-S195-L001", "O2-AG2-S196-L001", "O2-AG3-S197-L001", "O2-AG4-S198-L001", "O2-AG5-S199-L001",
+                            "O3-AG1-S200-L001", "O3-AG2-S201-L001", "O3-AG3-S202-L001", "O3-AG4-S203-L001")
+
+# Define leaves galled by Andricus samples
+leaves_galled_by_andricus_samples <- c("O1-AG1-GPOS-S145-L001", "O1-AG2-GPOS-S146-L001", "O1-AG3-GPOS-S147-L001", "O1-AG4-GPOS-S148-L001", "O1-AG5-GPOS-S149-L001",
+                                       "O2-AG1-GPOS-S150-L001", "O2-AG2-GPOS-S151-L001", "O2-AG3-GPOS-S152-L001", "O2-AG4-GPOS-S153-L001", "O2-AG5-GPOS-S154-L001",
+                                       "O3-AG1-GPOS-S155-L001", "O3-AG2-GPOS-S156-L001", "O3-AG3-GPOS-S157-L001", "O3-AG4-GPOS-S158-L001")
+
+
+# Define ungalled leaf samples
+ungalled_leaves <- c("O1-G-1-S160-L001", "O1-G-2-S161-L001", "O1-G-3-S162-L001", "O1-G-4-S163-L001", "O1-G-5-S164-L001",
+                     "O2-G-1-S165-L001", "O2-G-2-S166-L001", "O2-G-3-S167-L001", "O2-G-4-S168-L001", "O2-G-5-S169-L001",
+                     "O3-G-1-S170-L001", "O3-G-2-S171-L001", "O3-G-3-S172-L001", "O3-G-4-S173-L001", "O3-G-5-S174-L001")
+
+# Presence/absence phyloseq object
+# Function to convert OTU counts to presence/absence
+make_presence_absence <- function(physeq_obj) {
+  otu_table_binary <- otu_table(physeq_obj)
+  
+  # Convert OTU counts to binary presence/absence (1 if present, 0 if absent)
+  otu_table_binary[otu_table_binary > 0] <- 1
+  
+  # Create a new phyloseq object with the transformed binary OTU table
+  physeq_pa <- phyloseq(otu_table(otu_table_binary, taxa_are_rows = TRUE), 
+                        sample_data(physeq_obj), 
+                        tax_table(physeq_obj))
+  
+  return(physeq_pa)
+}
+
+# Create the presence/absence phyloseq object
+PA_galls_project_physeq <- make_presence_absence(galls_project_physeq_updated)
+
+# Create relative abundance phyloseq object
+# Transform the OTU table to relative abundances
+RA_galls_project_physeq <- transform_sample_counts(galls_project_physeq_updated, function(x) x / sum(x))
+
+```
+
+### Export presence/absence data as csv files (OTU table, Taxonomy Table)
+```{r}
+# Define the directory where you want to save the CSV files
+output_directory <- "/Users/christopherbivins/Desktop/csv_files_for_galls_graphs/"
+
+# Ensure the directory exists
+if (!dir.exists(output_directory)) {
+  dir.create(output_directory, recursive = TRUE)
+}
+
+# Extract the OTU table (already in presence/absence format)
+otu_presence_absence <- as.data.frame(otu_table(PA_galls_project_physeq))
+otu_presence_absence$OTU_ID <- rownames(otu_presence_absence)
+
+# Extract the taxonomy table
+taxonomy_table <- as.data.frame(tax_table(PA_galls_project_physeq))
+taxonomy_table$OTU_ID <- rownames(taxonomy_table)
+
+# Extract the sample data (metadata) table
+sample_data_table <- as.data.frame(sample_data(PA_galls_project_physeq))
+
+# Define file paths
+otu_file_path <- file.path(output_directory, "OTU_presence_absence_table.csv")
+taxonomy_file_path <- file.path(output_directory, "taxonomy_table.csv")
+sample_data_file_path <- file.path(output_directory, "sample_data_table.csv")
+
+# Write the OTU table to a CSV file
+write.csv(otu_presence_absence, file = otu_file_path, row.names = FALSE)
+
+# Write the taxonomy table to a CSV file
+write.csv(taxonomy_table, file = taxonomy_file_path, row.names = FALSE)
+
+
+# Print messages indicating the files were saved
+cat("OTU presence/absence table saved to:", otu_file_path, "\n")
+cat("Taxonomy table saved to:", taxonomy_file_path, "\n")
+
+
+```
+
+
+
+## Alpha Diversity: Richness and Shannon Diversity Metrics 
+```{r}
+
+
+
+# Set the directory to save CSV files
+output_directory <- "/Users/christopherbivins/Desktop/csv_files_for_galls_graphs"
+
+# Load your phyloseq object with raw sequence count values
+# Assuming galls_project_physeq_updated is already loaded
+
+# Define the sample groups
+cynips_galls_samples <- c("O1-CQ1-S205-L001", "O1-CQ2-S206-L001", "O1-CQ3-S207-L001", "O1-CQ4-S208-L001", "O1-CQ5-S209-L001",
+                          "O2-CQ1-S210-L001", "O2-CQ2-S211-L001", "O2-CQ3-S212-L001", "O2-CQ4-S213-L001", "O2-CQ5-S214-L001",
+                          "O3-CQ1-S215-L001", "O3-CQ2-S216-L001", "O3-CQ3-S217-L001", "O3-CQ4-S218-L001", "O3-CQ5-S219-L001")
+
+leaves_galled_by_cynips_samples <- c("O1-CQ1-GPOS-S175-L001", "O1-CQ2-GPOS-S176-L001", "O1-CQ3-GPOS-S177-L001", "O1-CQ4-GPOS-S178-L001", "O1-CQ5-GPOS-S179-L001",
+                                     "O2-CQ1-GPOS-S180-L001", "O2-CQ2-GPOS-S181-L001", "O2-CQ3-GPOS-S182-L001", "O2-CQ4-GPOS-S183-L001", "O2-CQ5-GPOS-S184-L001",
+                                     "O3-CQ1-GPOS-S185-L001", "O3-CQ2-GPOS-S186-L001", "O3-CQ3-GPOS-S187-L001", "O3-CQ4-GPOS-S188-L001", "O3-CQ5-GPOS-S189-L001")
+
+andricus_galls_samples <- c("O1-AG1-S190-L001", "O1-AG2-S191-L001", "O1-AG3-S192-L001", "O1-AG4-S193-L001", "O1-AG5-S194-L001",
+                            "O2-AG1-S195-L001", "O2-AG2-S196-L001", "O2-AG3-S197-L001", "O2-AG4-S198-L001", "O2-AG5-S199-L001",
+                            "O3-AG1-S200-L001", "O3-AG2-S201-L001", "O3-AG3-S202-L001", "O3-AG4-S203-L001")
+
+leaves_galled_by_andricus_samples <- c("O1-AG1-GPOS-S145-L001", "O1-AG2-GPOS-S146-L001", "O1-AG3-GPOS-S147-L001", "O1-AG4-GPOS-S148-L001", "O1-AG5-GPOS-S149-L001",
+                                       "O2-AG1-GPOS-S150-L001", "O2-AG2-GPOS-S151-L001", "O2-AG3-GPOS-S152-L001", "O2-AG4-GPOS-S153-L001", "O2-AG5-GPOS-S154-L001",
+                                       "O3-AG1-GPOS-S155-L001", "O3-AG2-GPOS-S156-L001", "O3-AG3-GPOS-S157-L001", "O3-AG4-GPOS-S158-L001")
+
+ungalled_leaves <- c("O1-G-1-S160-L001", "O1-G-2-S161-L001", "O1-G-3-S162-L001", "O1-G-4-S163-L001", 
+                     "O2-G-1-S165-L001", "O2-G-2-S166-L001", "O2-G-3-S167-L001", "O2-G-4-S168-L001", "O2-G-5-S169-L001",
+                     "O3-G-1-S170-L001", "O3-G-2-S171-L001", "O3-G-3-S172-L001", "O3-G-4-S173-L001", "O3-G-5-S174-L001")
+
+# Filter out problematic sample
+ungalled_leaves <- setdiff(ungalled_leaves, "O1-G-5-S164-L001")
+
+# Subset the phyloseq object for each treatment group
+cynips_galls_physeq <- prune_samples(cynips_galls_samples, galls_project_physeq_updated)
+leaves_galled_by_cynips_physeq <- prune_samples(leaves_galled_by_cynips_samples, galls_project_physeq_updated)
+andricus_galls_physeq <- prune_samples(andricus_galls_samples, galls_project_physeq_updated)
+leaves_galled_by_andricus_physeq <- prune_samples(leaves_galled_by_andricus_samples, galls_project_physeq_updated)
+ungalled_leaves_physeq <- prune_samples(ungalled_leaves, galls_project_physeq_updated)
+
+# Calculate species richness and Shannon diversity for each treatment group
+richness_data <- data.frame(
+  Sample = sample_names(galls_project_physeq_updated),
+  Treatment = sample_data(galls_project_physeq_updated)$Treatment,
+  Richness = estimate_richness(galls_project_physeq_updated, measures = "Observed")$Observed,
+  Shannon = estimate_richness(galls_project_physeq_updated, measures = "Shannon")$Shannon
+)
+
+# Save richness and Shannon diversity data to CSV
+write.csv(richness_data, file.path(output_directory, "richness_shannon_diversity.csv"))
+
+# Kruskal-Wallis test for Richness
+kruskal_richness <- kruskal.test(Richness ~ Treatment, data = richness_data)
+
+# Dunn's post-hoc test for Richness
+dunn_richness <- dunnTest(Richness ~ Treatment, data = richness_data, method = "bh")
+
+# Kruskal-Wallis test for Shannon Diversity
+kruskal_shannon <- kruskal.test(Shannon ~ Treatment, data = richness_data)
+
+# Dunn's post-hoc test for Shannon Diversity
+dunn_shannon <- dunnTest(Shannon ~ Treatment, data = richness_data, method = "bh")
+
+# Save the Dunn's test results to CSV
+
+write.csv(dunn_richness$res, file.path(output_directory, "dunn_richness.csv"))
+
+
+write.csv(dunn_shannon$res, file.path(output_directory, "dunn_shannon.csv"))
+
+```
+
+## Beta Diversity
+
+##### The below code aims to organize the data into various structures and formats for the purposes of running beta diversity analyses. Two different distance matrices will be created: Jaccard's Distance Matrix (based only on presence/absence data), and a Bray-Curtis' Distance Matrix (which takes into account absolute sequence count abundances).
+
+### Create Jaccard's Distance Matrix
+```{r}
+# Extract the OTU table from the phyloseq object and convert to matrix
+otu_table_binary <- as(otu_table(galls_project_physeq_updated), "matrix")
+
+# Convert the OTU table to binary (presence/absence) format
+otu_table_binary[otu_table_binary > 0] <- 1
+
+# Identify OTUs with zeros across all samples
+empty_otus <- rownames(otu_table_binary)[rowSums(otu_table_binary) == 0]
+
+# Find samples with all zero counts
+zero_count_samples <- colnames(otu_table_endophytes)[colSums(otu_table_endophytes) == 0]
+
+# Remove OTUs that are absent across all samples
+otu_table_filtered <- otu_table_binary[rowSums(otu_table_binary) > 0, ]
+
+otu_table_filtered <- otu_table_filtered[, colSums(otu_table_filtered) > 0]
+
+# Transpose the OTU table to ensure rows represent samples
+otu_table_filtered_transposed <- t(otu_table_filtered)
+
+# Calculate the Jaccard distance matrix using vegan's vegdist function
+jaccard_distance_matrix <- vegdist(otu_table_filtered_transposed, method = "jaccard")
+
+# Display a subset of the matrix to verify symmetry and diagonal
+jaccard_matrix_full <- as.matrix(jaccard_distance_matrix)
+print(jaccard_matrix_full[1:5, 1:5])
+
+# Check that all diagonal values are zero
+diag_values <- diag(jaccard_matrix_full)
+print(diag_values)  # Should all be zero
+```
+
+### Create Bray-Curtis Distance Matrix (based on relative sequence count abundances from OTU table)
+
+```{r}
+# Extract the OTU table from the phyloseq object and convert it to a matrix
+otu_table_matrix <- as(otu_table(galls_project_physeq_updated), "matrix")
+
+# Calculate the total sum of OTU counts for each sample (column-wise sum)
+sample_sums <- colSums(otu_table_matrix)
+
+# Identify samples with zero OTU counts
+zero_sum_samples <- names(sample_sums[sample_sums == 0])
+
+# Remove the sample with zero OTU counts (if any)
+otu_table_filtered <- otu_table_matrix[, !colnames(otu_table_matrix) %in% zero_sum_samples]
+
+# Convert the remaining OTU counts to relative abundances
+sample_sums_filtered <- colSums(otu_table_filtered)
+otu_table_rel_abundance <- sweep(otu_table_filtered, 2, sample_sums_filtered, FUN = "/")
+
+# Transpose the OTU table to ensure rows represent samples for distance matrix calculation
+otu_table_filtered_transposed <- t(otu_table_rel_abundance)
+
+# Calculate the Bray-Curtis distance matrix using vegan's vegdist function based on relative abundances
+bray_curtis_distance_matrix <- vegdist(otu_table_filtered_transposed, method = "bray")
+
+# Display a subset of the matrix to verify symmetry and diagonal
+bray_curtis_matrix_full <- as.matrix(bray_curtis_distance_matrix)
+print(bray_curtis_matrix_full[1:5, 1:5])
+
+# Check the diagonal values (they should not necessarily be zero in Bray-Curtis, but it’s good to inspect)
+diag_values_bray <- diag(bray_curtis_matrix_full)
+print(diag_values_bray)  # Inspect the diagonal values
+
+# Verify that the matrix is symmetric
+is_symmetric <- all.equal(bray_curtis_matrix_full, t(bray_curtis_matrix_full))
+cat("Is the Bray-Curtis distance matrix symmetric?", is_symmetric, "\n")
+
+```
+
+
+### Run PERMANOVAs on all of the different group comparisons
+
+#### Define sample groups in a list
+##### Since there are 5 different treatment groups, 10 of the comparisons will solely rely on utilizing the name of each treatment group from the Treatment column in the sample_data_df dataframe, so defining the first 10 sample groups is straightforward. However, there are three group comparisons I want to do that require a bit more complex definitions. I want to look at how different galled leaves are as a WHOLE (i.e., the leaf AND the gall) relative to ungalled leaves. This necessitates defining galled leaves as a whole as a combination of two treatment types (i.e, gall samples and the galled leaf samples, for each wasp species, respectively). First, the code below will define the three groups that look at galled leaves as a whole as groups for comparisons, then a list will be created that defines all 13 groups that will be compared. 
+
+### Convert sample_data table to a plain dataframe:
+```{r}
+# Convert sample_data to a plain data frame
+sample_data_df <- as(sample_data(galls_project_physeq_updated), "data.frame")
+
+# Ensure that the Treatment column is a factor
+sample_data_df$Treatment <- as.factor(sample_data_df$Treatment)
+
+# Check the structure to confirm
+str(sample_data_df)
+
+### Define collective treatments (i.e., galled leaves as a whole)
+# Step 1: Convert Treatment_Collective to a character vector if not already
+sample_data_df$Treatment_Collective <- as.character(sample_data_df$Treatment)
+
+# Step 2: Combine Cynips_Gall and Leaf_galled_by_Cynips into Cynips_Collective
+sample_data_df$Treatment_Collective[sample_data_df$Treatment %in% c("Cynips_Gall", "Leaf_galled_by_Cynips")] <- "Cynips_Collective"
+
+# Step 3: Combine Andricus_Gall and Leaf_galled_by_Andricus into Andricus_Collective
+sample_data_df$Treatment_Collective[sample_data_df$Treatment %in% c("Andricus_Gall", "Leaf_galled_by_Andricus")] <- "Andricus_Collective"
+
+# Step 4: Convert back to a factor (optional)
+sample_data_df$Treatment_Collective <- as.factor(sample_data_df$Treatment_Collective)
+
+# Step 5: Verify the new grouping
+table(sample_data_df$Treatment_Collective)
+```
+
+```{r}
+# Define the group comparisons
+pairwise_comparisons <- list(
+  c("Cynips_Gall", "Leaf_galled_by_Cynips"),
+  c("Cynips_Gall", "Ungalled_leaf"),
+  c("Leaf_galled_by_Cynips", "Ungalled_leaf"),
+  c("Andricus_Gall", "Leaf_galled_by_Andricus"),
+  c("Andricus_Gall", "Ungalled_leaf"),
+  c("Leaf_galled_by_Andricus", "Ungalled_leaf"),
+  c("Cynips_Gall", "Andricus_Gall"),
+  c("Cynips_Gall", "Leaf_galled_by_Andricus"),
+  c("Andricus_Gall", "Leaf_galled_by_Cynips"),
+  c("Leaf_galled_by_Cynips", "Leaf_galled_by_Andricus"),
+  c("Cynips_Collective", "Ungalled_leaf"),
+  c("Andricus_Collective", "Ungalled_leaf"),
+  c("Cynips_Collective", "Andricus_Collective")
+)
+
+```
+
+##### In order to run PERMANOVAs and create ordination plots showing differences between different treatment groups, I need to first prepare/trasnform my sample metadata so that sample names from the distance matrices will be aligned with the three different treatment matrices for the purposes of subsetting the matrix data into the different treatment groups defined above.
+
+#### Align sample_data with matrices
+```{r}
+# Get the row names for each matrix
+jaccard_row_names <- rownames(as.matrix(jaccard_distance_matrix))
+bray_curtis_row_names <- rownames(as.matrix(bray_curtis_distance_matrix))
+
+
+# Find the intersection of sample names across all three matrices
+common_samples <- Reduce(intersect, list(jaccard_row_names, bray_curtis_row_names))
+
+# Subset sample_data_df to include only the common samples
+sample_data_df <- sample_data_df[rownames(sample_data_df) %in% common_samples, ]
+
+# Verify alignment
+unmatched_in_sample_data <- setdiff(rownames(sample_data_df), common_samples)
+unmatched_in_matrix <- setdiff(common_samples, rownames(sample_data_df))
+
+if (length(unmatched_in_sample_data) > 0 || length(unmatched_in_matrix) > 0) {
+    warning("There are unmatched samples between the sample data and the matrices.")
+}
+
+# Print unmatched samples in sample_data_df
+print(unmatched_in_sample_data)
+
+# Print unmatched samples in the matrices
+print(unmatched_in_matrix)
+
+```
+
+### Run PERMANOVAs
+
+```{r}
+# Initialize vectors to store p-values, R² values, group DF, and residual DF for both Jaccard and Bray-Curtis
+jaccard_p_values <- numeric(length(pairwise_comparisons))
+jaccard_r_squared <- numeric(length(pairwise_comparisons))
+jaccard_df <- numeric(length(pairwise_comparisons))
+jaccard_residual_df <- numeric(length(pairwise_comparisons))
+
+bray_curtis_p_values <- numeric(length(pairwise_comparisons))
+bray_curtis_r_squared <- numeric(length(pairwise_comparisons))
+bray_curtis_df <- numeric(length(pairwise_comparisons))
+bray_curtis_residual_df <- numeric(length(pairwise_comparisons))
+
+# Loop through all comparisons and distance matrices
+for (i in seq_along(pairwise_comparisons)) {
+  comparison <- pairwise_comparisons[[i]]
+  
+  # Determine whether to use the collective groups or not
+  use_collective <- ifelse(i > 10, TRUE, FALSE)
+  
+  print(paste("Running comparison:", paste(comparison, collapse = " vs ")))
+  print(paste("Using Treatment_Collective:", use_collective))
+  
+  # Subset the data based on comparison type
+  if (use_collective) {
+    subset_data <- sample_data_df[sample_data_df$Treatment_Collective %in% comparison, ]
+    grouping_col <- "Treatment_Collective"
+  } else {
+    subset_data <- sample_data_df[sample_data_df$Treatment %in% comparison, ]
+    grouping_col <- "Treatment"
+  }
+  
+  # Ensure the grouping column is a factor
+  subset_data[[grouping_col]] <- factor(subset_data[[grouping_col]])
+  
+  # Create the formula dynamically
+  formula <- as.formula(paste("subset_matrix ~", grouping_col))
+  
+  # Define a function to run PERMANOVA and extract p-value, R², and DF, including residual DF
+  run_and_extract_permanova_results <- function(distance_matrix) {
+    subset_matrix <- as.dist(as.matrix(distance_matrix)[rownames(subset_data), rownames(subset_data)])
+    adonis_result <- tryCatch({
+      adonis2(formula, data = subset_data)
+    }, error = function(e) {
+      warning(paste("PERMANOVA failed:", e$message))
+      return(list(p_value = NA, r_squared = NA, df = NA, residual_df = NA))
+    })
+    
+    if (!is.null(adonis_result) && length(adonis_result) > 1) {
+      # Extract p-value, R², group DF, and residual DF from the adonis result
+      p_value <- adonis_result$`Pr(>F)`[1]
+      r_squared <- adonis_result$R2[1]
+      df <- adonis_result$Df[1]  # Group DF
+      residual_df <- adonis_result$Df[2]  # Residual DF
+      
+      return(list(p_value = p_value, r_squared = r_squared, df = df, residual_df = residual_df))
+    } else {
+      return(list(p_value = NA, r_squared = NA, df = NA, residual_df = NA))
+    }
+  }
+  
+  # Extract PERMANOVA results for each distance matrix (Jaccard and Bray-Curtis)
+  jaccard_results <- run_and_extract_permanova_results(jaccard_distance_matrix)
+  bray_curtis_results <- run_and_extract_permanova_results(bray_curtis_distance_matrix)
+  
+  # Store results for Jaccard
+  jaccard_p_values[i] <- jaccard_results$p_value
+  jaccard_r_squared[i] <- jaccard_results$r_squared
+  jaccard_df[i] <- jaccard_results$df
+  jaccard_residual_df[i] <- jaccard_results$residual_df
+  
+  # Store results for Bray-Curtis
+  bray_curtis_p_values[i] <- bray_curtis_results$p_value
+  bray_curtis_r_squared[i] <- bray_curtis_results$r_squared
+  bray_curtis_df[i] <- bray_curtis_results$df
+  bray_curtis_residual_df[i] <- bray_curtis_results$residual_df
+  
+  # Print results to ensure they are stored correctly
+  print(paste("Extracted results for comparison:", paste(comparison, collapse = " vs ")))
+  print(paste("Jaccard - P-value:", jaccard_p_values[i], "R²:", jaccard_r_squared[i], "DF:", jaccard_df[i], "Residual DF:", jaccard_residual_df[i]))
+  print(paste("Bray-Curtis - P-value:", bray_curtis_p_values[i], "R²:", bray_curtis_r_squared[i], "DF:", bray_curtis_df[i], "Residual DF:", bray_curtis_residual_df[i]))
+}
+
+# After the loop, populate the permanova_results data frame with the required columns
+permanova_results <- data.frame(
+  Group_Comparison = sapply(pairwise_comparisons, paste, collapse = " vs "),
+  Jaccard_P_value = jaccard_p_values,
+  Jaccard_R_squared = jaccard_r_squared,
+  Jaccard_DF = jaccard_df,
+  Jaccard_Residual_DF = jaccard_residual_df,
+  Bray_Curtis_P_value = bray_curtis_p_values,
+  Bray_Curtis_R_squared = bray_curtis_r_squared,
+  Bray_Curtis_DF = bray_curtis_df,
+  Bray_Curtis_Residual_DF = bray_curtis_residual_df,
+  stringsAsFactors = FALSE
+)
+
+# Print the final results table
+print(permanova_results)
+
+```
+
+
+
+#### Export distance matrices and PERMANOVA results as csv files for making plots with other programs:
+```{r}
+# Export the Jaccard NMDS dataset to a CSV file in the specified directory
+write.csv(nmds_jaccard_df, "/Users/christopherbivins/Desktop/csv_files_for_galls_graphs/nmds_jaccard_df.csv", row.names = FALSE)
+
+# Export the Bray-Curtis NMDS dataset to a CSV file in the specified directory
+write.csv(nmds_bray_df, "/Users/christopherbivins/Desktop/csv_files_for_galls_graphs/nmds_bray_df.csv", row.names = FALSE)
+
+# Export the PERMANOVA results dataframe to a CSV file in the specified directory
+write.csv(permanova_results, "/Users/christopherbivins/Desktop/csv_files_for_galls_graphs/permanova_results.csv", row.names = FALSE)
+
+
+
+```
+
+### What percent of community dissimilarity between galls and galled leaves is due to turnover and nestedness
+```{r}
+# Remove the sample with zero counts
+samples_to_remove <- c("O1-G-5-S164-L001")
+
+# Remove the sample from the sample groups if it's present
+cynips_galls_samples <- setdiff(cynips_galls_samples, samples_to_remove)
+leaves_galled_by_cynips_samples <- setdiff(leaves_galled_by_cynips_samples, samples_to_remove)
+andricus_galls_samples <- setdiff(andricus_galls_samples, samples_to_remove)
+leaves_galled_by_andricus_samples <- setdiff(leaves_galled_by_andricus_samples, samples_to_remove)
+ungalled_leaves <- setdiff(ungalled_leaves, samples_to_remove)
+
+# Extract the OTU table from the phyloseq object and convert to a matrix
+otu_table_pa <- as(otu_table(PA_galls_project_physeq), "matrix")
+
+# Remove the sample with zero counts from the OTU table
+otu_table_pa <- otu_table_pa[, !colnames(otu_table_pa) %in% samples_to_remove]
+
+# Remove any samples with zero counts across all OTUs
+otu_table_pa <- otu_table_pa[, colSums(otu_table_pa) > 0]
+
+# ----------------------------------------------------------------------------------
+# Analysis for Cynips
+# ----------------------------------------------------------------------------------
+
+# Combine Cynips gall samples and leaves galled by Cynips
+cynips_samples <- c(cynips_galls_samples, leaves_galled_by_cynips_samples)
+
+# Subset the OTU table for Cynips samples
+otu_cynips <- otu_table_pa[, colnames(otu_table_pa) %in% cynips_samples]
+
+# Remove OTUs absent across all Cynips samples
+otu_cynips <- otu_cynips[rowSums(otu_cynips) > 0, ]
+
+# Create group labels for Cynips samples
+group_labels_cynips <- data.frame(
+  sample = colnames(otu_cynips),
+  group = ifelse(colnames(otu_cynips) %in% cynips_galls_samples, "Cynips_Gall", "Leaf_galled_by_Cynips")
+)
+
+# Transpose the OTU table so that samples are rows
+otu_cynips_pa <- as.data.frame(t(otu_cynips))
+
+# Calculate beta diversity components for Cynips using betapart
+beta_cynips <- beta.pair(otu_cynips_pa, index.family = "jaccard")
+
+# Extract dissimilarity matrices
+turnover_cynips <- as.matrix(beta_cynips$beta.jtu)
+nestedness_cynips <- as.matrix(beta_cynips$beta.jne)
+total_beta_cynips <- as.matrix(beta_cynips$beta.jac)
+
+# Get indices for each group
+gall_indices_cynips <- which(group_labels_cynips$group == "Cynips_Gall")
+leaf_indices_cynips <- which(group_labels_cynips$group == "Leaf_galled_by_Cynips")
+
+# Extract pairwise distances between groups
+turnover_between_cynips <- turnover_cynips[gall_indices_cynips, leaf_indices_cynips]
+nestedness_between_cynips <- nestedness_cynips[gall_indices_cynips, leaf_indices_cynips]
+total_beta_between_cynips <- total_beta_cynips[gall_indices_cynips, leaf_indices_cynips]
+
+# Calculate mean dissimilarities
+mean_turnover_between_cynips <- mean(turnover_between_cynips)
+mean_nestedness_between_cynips <- mean(nestedness_between_cynips)
+mean_total_beta_between_cynips <- mean(total_beta_between_cynips)
+
+# Calculate percentages
+percent_turnover_cynips <- (mean_turnover_between_cynips / mean_total_beta_between_cynips) * 100
+percent_nestedness_cynips <- (mean_nestedness_between_cynips / mean_total_beta_between_cynips) * 100
+
+# Output the results for Cynips
+cat("Cynips Gall vs. Leaves Galled by Cynips:\n")
+cat("Mean Total Beta Diversity (Jaccard Dissimilarity):", mean_total_beta_between_cynips, "\n")
+cat("Mean Turnover Component:", mean_turnover_between_cynips, "\n")
+cat("Mean Nestedness Component:", mean_nestedness_between_cynips, "\n")
+cat("Percentage Turnover:", percent_turnover_cynips, "%\n")
+cat("Percentage Nestedness:", percent_nestedness_cynips, "%\n\n")
+
+# ----------------------------------------------------------------------------------
+# Analysis for Andricus
+# ----------------------------------------------------------------------------------
+
+# Combine Andricus gall samples and leaves galled by Andricus
+andricus_samples <- c(andricus_galls_samples, leaves_galled_by_andricus_samples)
+
+# Subset the OTU table for Andricus samples
+otu_andricus <- otu_table_pa[, colnames(otu_table_pa) %in% andricus_samples]
+
+# Remove OTUs absent across all Andricus samples
+otu_andricus <- otu_andricus[rowSums(otu_andricus) > 0, ]
+
+# Create group labels for Andricus samples
+group_labels_andricus <- data.frame(
+  sample = colnames(otu_andricus),
+  group = ifelse(colnames(otu_andricus) %in% andricus_galls_samples, "Andricus_Gall", "Leaf_galled_by_Andricus")
+)
+
+# Transpose the OTU table so that samples are rows
+otu_andricus_pa <- as.data.frame(t(otu_andricus))
+
+# Calculate beta diversity components for Andricus using betapart
+beta_andricus <- beta.pair(otu_andricus_pa, index.family = "jaccard")
+
+# Extract dissimilarity matrices
+turnover_andricus <- as.matrix(beta_andricus$beta.jtu)
+nestedness_andricus <- as.matrix(beta_andricus$beta.jne)
+total_beta_andricus <- as.matrix(beta_andricus$beta.jac)
+
+# Get indices for each group
+gall_indices_andricus <- which(group_labels_andricus$group == "Andricus_Gall")
+leaf_indices_andricus <- which(group_labels_andricus$group == "Leaf_galled_by_Andricus")
+
+# Extract pairwise distances between groups
+turnover_between_andricus <- turnover_andricus[gall_indices_andricus, leaf_indices_andricus]
+nestedness_between_andricus <- nestedness_andricus[gall_indices_andricus, leaf_indices_andricus]
+total_beta_between_andricus <- total_beta_andricus[gall_indices_andricus, leaf_indices_andricus]
+
+# Calculate mean dissimilarities
+mean_turnover_between_andricus <- mean(turnover_between_andricus)
+mean_nestedness_between_andricus <- mean(nestedness_between_andricus)
+mean_total_beta_between_andricus <- mean(total_beta_between_andricus)
+
+# Calculate percentages
+percent_turnover_andricus <- (mean_turnover_between_andricus / mean_total_beta_between_andricus) * 100
+percent_nestedness_andricus <- (mean_nestedness_between_andricus / mean_total_beta_between_andricus) * 100
+
+# Output the results for Andricus
+cat("Andricus Gall vs. Leaves Galled by Andricus:\n")
+cat("Mean Total Beta Diversity (Jaccard Dissimilarity):", mean_total_beta_between_andricus, "\n")
+cat("Mean Turnover Component:", mean_turnover_between_andricus, "\n")
+cat("Mean Nestedness Component:", mean_nestedness_between_andricus, "\n")
+cat("Percentage Turnover:", percent_turnover_andricus, "%\n")
+cat("Percentage Nestedness:", percent_nestedness_andricus, "%\n")
+
+```
+
+### What percent of community dissimilarity between ungalled leaves and galled leaves is due to turnover and nestedness
+```{r}
+
+# Data Cleaning: Remove samples with zero counts
+# Identify samples with zero counts
+zero_count_samples <- names(which(sample_sums(PA_galls_project_physeq) == 0))
+
+# Remove zero count samples from the phyloseq object
+PA_galls_project_physeq <- prune_samples(!(sample_names(PA_galls_project_physeq) %in% zero_count_samples), PA_galls_project_physeq)
+
+# Subset samples for the comparisons
+ungalled_samples <- sample_names(subset_samples(PA_galls_project_physeq, Treatment == "Ungalled_leaf"))
+leaves_galled_by_cynips_samples <- sample_names(subset_samples(PA_galls_project_physeq, Treatment == "Leaf_galled_by_Cynips"))
+leaves_galled_by_andricus_samples <- sample_names(subset_samples(PA_galls_project_physeq, Treatment == "Leaf_galled_by_Andricus"))
+
+# Function to calculate beta diversity components between two groups
+calculate_beta_diversity <- function(group1_samples, group2_samples, group1_label, group2_label) {
+  # Subset the OTU table for the two groups
+  otu_table_group1 <- otu_table(PA_galls_project_physeq)[, group1_samples]
+  otu_table_group2 <- otu_table(PA_galls_project_physeq)[, group2_samples]
+  
+  # Combine the OTU tables
+  combined_otu_table <- cbind(otu_table_group1, otu_table_group2)
+  
+  # Remove OTUs that are absent in all samples
+  combined_otu_table <- combined_otu_table[rowSums(combined_otu_table) > 0, ]
+  
+  # Convert to presence-absence data
+  otu_pa <- decostand(t(combined_otu_table), method = "pa")
+  
+  # Create group labels
+  group_labels <- c(rep(group1_label, length(group1_samples)), rep(group2_label, length(group2_samples)))
+  
+  # Calculate beta diversity components
+  beta_result <- beta.pair(otu_pa, index.family = "jaccard")
+  
+  # Extract the pairwise distance matrices
+  turnover <- as.matrix(beta_result$beta.jtu)
+  nestedness <- as.matrix(beta_result$beta.jne)
+  total_beta <- as.matrix(beta_result$beta.jac)
+  
+  # Extract distances between group1 and group2 samples
+  turnover_between_groups <- turnover[group_labels == group1_label, group_labels == group2_label]
+  nestedness_between_groups <- nestedness[group_labels == group1_label, group_labels == group2_label]
+  total_beta_between_groups <- total_beta[group_labels == group1_label, group_labels == group2_label]
+  
+  # Calculate mean dissimilarities
+  mean_turnover <- mean(turnover_between_groups)
+  mean_nestedness <- mean(nestedness_between_groups)
+  mean_total_beta <- mean(total_beta_between_groups)
+  
+  # Calculate percentages
+  percent_turnover <- (mean_turnover / mean_total_beta) * 100
+  percent_nestedness <- (mean_nestedness / mean_total_beta) * 100
+  
+  # Output the results
+  cat(group1_label, "vs.", group2_label, ":\n")
+  cat("Mean Total Beta Diversity (Jaccard Dissimilarity):", mean_total_beta, "\n")
+  cat("Mean Turnover Component:", mean_turnover, "\n")
+  cat("Mean Nestedness Component:", mean_nestedness, "\n")
+  cat("Percentage Turnover:", percent_turnover, "%\n")
+  cat("Percentage Nestedness:", percent_nestedness, "%\n\n")
+}
+
+# Calculate beta diversity between Ungalled leaves and leaves galled by Cynips
+calculate_beta_diversity(ungalled_samples, leaves_galled_by_cynips_samples, "Ungalled_leaf", "Leaf_galled_by_Cynips")
+
+# Calculate beta diversity between Ungalled leaves and leaves galled by Andricus
+calculate_beta_diversity(ungalled_samples, leaves_galled_by_andricus_samples, "Ungalled_leaf", "Leaf_galled_by_Andricus")
+
+```
+
+## Unique OTUs
+#### Which OTUs are only present in certain sample types?
+```{r}
+
+
+# Subset the phyloseq object for each group
+andricus_galls_physeq <- subset_samples(PA_galls_project_physeq, sample_names(PA_galls_project_physeq) %in% andricus_galls_samples)
+cynips_galls_physeq <- subset_samples(PA_galls_project_physeq, sample_names(PA_galls_project_physeq) %in% cynips_galls_samples)
+leaves_galled_by_andricus_physeq <- subset_samples(PA_galls_project_physeq, sample_names(PA_galls_project_physeq) %in% leaves_galled_by_andricus_samples)
+leaves_galled_by_cynips_physeq <- subset_samples(PA_galls_project_physeq, sample_names(PA_galls_project_physeq) %in% leaves_galled_by_cynips_samples)
+ungalled_leaves_physeq <- subset_samples(PA_galls_project_physeq, sample_names(PA_galls_project_physeq) %in% ungalled_leaves)
+
+# Convert OTU tables for each subset to data frames
+andricus_galls_otus <- as(otu_table(andricus_galls_physeq), "matrix")
+cynips_galls_otus <- as(otu_table(cynips_galls_physeq), "matrix")
+leaves_galled_by_andricus_otus <- as(otu_table(leaves_galled_by_andricus_physeq), "matrix")
+leaves_galled_by_cynips_otus <- as(otu_table(leaves_galled_by_cynips_physeq), "matrix")
+ungalled_leaves_otus <- as(otu_table(ungalled_leaves_physeq), "matrix")
+
+# Find OTUs that are ONLY present in each group
+# Function to identify unique OTUs in a group
+unique_otus <- function(group_otus, other_groups_otus) {
+  group_presence <- rowSums(group_otus) > 0 # OTUs present in the group
+  other_presence <- apply(other_groups_otus, 1, function(x) sum(x) > 0) # OTUs present in any other group
+  unique_to_group <- group_presence & !other_presence # Only present in the group, not in others
+  return(rownames(group_otus)[unique_to_group])
+}
+
+# Combine the OTU matrices of all other groups for comparison
+all_other_otus <- list(
+  andricus_galls_otus, 
+  cynips_galls_otus, 
+  leaves_galled_by_andricus_otus, 
+  leaves_galled_by_cynips_otus, 
+  ungalled_leaves_otus
+)
+
+# Find unique OTUs for each group
+unique_andricus_galls_otus <- unique_otus(andricus_galls_otus, do.call(cbind, all_other_otus[-1]))
+unique_cynips_galls_otus <- unique_otus(cynips_galls_otus, do.call(cbind, all_other_otus[-2]))
+unique_leaves_galled_by_andricus_otus <- unique_otus(leaves_galled_by_andricus_otus, do.call(cbind, all_other_otus[-3]))
+unique_leaves_galled_by_cynips_otus <- unique_otus(leaves_galled_by_cynips_otus, do.call(cbind, all_other_otus[-4]))
+unique_ungalled_leaves_otus <- unique_otus(ungalled_leaves_otus, do.call(cbind, all_other_otus[-5]))
+
+# Print the unique OTUs for each group
+cat("Unique OTUs in Andricus Galls:\n", unique_andricus_galls_otus, "\n\n")
+cat("Unique OTUs in Cynips Galls:\n", unique_cynips_galls_otus, "\n\n")
+cat("Unique OTUs in Leaves Galled by Andricus:\n", unique_leaves_galled_by_andricus_otus, "\n\n")
+cat("Unique OTUs in Leaves Galled by Cynips:\n", unique_leaves_galled_by_cynips_otus, "\n\n")
+cat("Unique OTUs in Ungalled Leaves:\n", unique_ungalled_leaves_otus, "\n")
+
+
+# Extract taxonomy data for the unique OTUs
+unique_andricus_galls_taxa <- tax_table(PA_galls_project_physeq)[unique_andricus_galls_otus, ]
+unique_cynips_galls_taxa <- tax_table(PA_galls_project_physeq)[unique_cynips_galls_otus, ]
+unique_leaves_galled_by_andricus_taxa <- tax_table(PA_galls_project_physeq)[unique_leaves_galled_by_andricus_otus, ]
+unique_leaves_galled_by_cynips_taxa <- tax_table(PA_galls_project_physeq)[unique_leaves_galled_by_cynips_otus, ]
+unique_ungalled_leaves_taxa <- tax_table(PA_galls_project_physeq)[unique_ungalled_leaves_otus, ]
+
+# Display taxonomy for a group (e.g., Andricus Galls)
+unique_andricus_galls_taxa
+
+```
+
+
+### Export data for OTUs (with taxonomy) that are unique to each treatment group as CSVs for plotting elsewhere
+```{r}
+# Define the output directory
+output_directory <- "/Users/christopherbivins/Desktop/csv_files_for_galls_graphs/unique_otus_each_group"
+
+# Ensure the directory exists
+if (!dir.exists(output_directory)) {
+  dir.create(output_directory, recursive = TRUE)
+}
+
+# Define file paths
+file_paths <- list(
+  "unique_andricus_galls_taxa" = file.path(output_directory, "unique_andricus_galls_taxa.csv"),
+  "unique_cynips_galls_taxa" = file.path(output_directory, "unique_cynips_galls_taxa.csv"),
+  "unique_leaves_galled_by_andricus_taxa" = file.path(output_directory, "unique_leaves_galled_by_andricus_taxa.csv"),
+  "unique_leaves_galled_by_cynips_taxa" = file.path(output_directory, "unique_leaves_galled_by_cynips_taxa.csv"),
+  "unique_ungalled_leaves_taxa" = file.path(output_directory, "unique_ungalled_leaves_taxa.csv")
+)
+
+# Export each dataframe to a CSV file
+write.csv(unique_andricus_galls_taxa, file_paths[["unique_andricus_galls_taxa"]], row.names = FALSE)
+write.csv(unique_cynips_galls_taxa, file_paths[["unique_cynips_galls_taxa"]], row.names = FALSE)
+write.csv(unique_leaves_galled_by_andricus_taxa, file_paths[["unique_leaves_galled_by_andricus_taxa"]], row.names = FALSE)
+write.csv(unique_leaves_galled_by_cynips_taxa, file_paths[["unique_leaves_galled_by_cynips_taxa"]], row.names = FALSE)
+write.csv(unique_ungalled_leaves_taxa, file_paths[["unique_ungalled_leaves_taxa"]], row.names = FALSE)
+
+# Output confirmation
+file_paths
+
+```
+
+
+
+### Venn Diagram (just OTUs unique to each treatment group)
+
+```{r}
+# Prepare lists for each group
+list_of_otus <- list(
+  "Andricus Galls" = unique_andricus_galls_otus,
+  "Cynips Galls" = unique_cynips_galls_otus,
+  "Leaves Galled by Andricus" = unique_leaves_galled_by_andricus_otus,
+  "Leaves Galled by Cynips" = unique_leaves_galled_by_cynips_otus,
+  "Ungalled Leaves" = unique_ungalled_leaves_otus
+)
+
+# Create a Venn diagram
+venn.plot1 <- venn.diagram(list_of_otus, 
+                          filename = NULL, 
+                          fill = c("red", "blue", "green", "yellow", "purple"), 
+                          alpha = 0.5, 
+                          cat.cex = 0.7)
+
+# Plot the Venn diagram
+grid.draw(venn.plot1)
+
+venn.plot1
+```
+
+### Venn Diagram (all OTUs, shared and unique, across treatment groups)
+```{r}
+# Extract OTU presence/absence matrices for each group
+andricus_galls_otus <- as(otu_table(andricus_galls_physeq), "matrix")
+cynips_galls_otus <- as(otu_table(cynips_galls_physeq), "matrix")
+leaves_galled_by_andricus_otus <- as(otu_table(leaves_galled_by_andricus_physeq), "matrix")
+leaves_galled_by_cynips_otus <- as(otu_table(leaves_galled_by_cynips_physeq), "matrix")
+ungalled_leaves_otus <- as(otu_table(ungalled_leaves_physeq), "matrix")
+
+# Define presence (OTUs present) for each group (binary transformation)
+andricus_galls_presence <- rowSums(andricus_galls_otus) > 0
+cynips_galls_presence <- rowSums(cynips_galls_otus) > 0
+leaves_galled_by_andricus_presence <- rowSums(leaves_galled_by_andricus_otus) > 0
+leaves_galled_by_cynips_presence <- rowSums(leaves_galled_by_cynips_otus) > 0
+ungalled_leaves_presence <- rowSums(ungalled_leaves_otus) > 0
+
+# Create a list of OTUs present in each group
+otus_list <- list(
+  "Andricus Galls" = names(which(andricus_galls_presence)),
+  "Cynips Galls" = names(which(cynips_galls_presence)),
+  "Leaves Galled by Andricus" = names(which(leaves_galled_by_andricus_presence)),
+  "Leaves Galled by Cynips" = names(which(leaves_galled_by_cynips_presence)),
+  "Ungalled Leaves" = names(which(ungalled_leaves_presence))
+)
+
+# Plot Venn diagram
+venn.plot <- venn.diagram(
+  otus_list,
+  filename = NULL,
+  fill = c("red", "blue", "green", "yellow", "purple"),
+  alpha = 0.5,
+  cat.cex = 0.7
+)
+
+# Display the Venn diagram
+grid.draw(venn.plot)
+
+
+### Without shitty labels
+# Plot Venn diagram without labels
+venn.plot <- venn.diagram(
+  otus_list,
+  filename = NULL,
+  fill = c("red", "blue", "green", "yellow", "purple"),
+  alpha = 0.5,
+  cat.cex = 0.7,
+  category.names = c("", "", "", "", ""),  # Set category names to empty strings
+  label.col = "black"  # Retain the labels for the overlaps
+)
+
+# Display the Venn diagram
+grid.draw(venn.plot)
+
+
+```
+
+### Export as svg
+```{r}
+# Specify the file path where the SVG will be saved
+file_path <- "/Users/christopherbivins/Desktop/csv_files_for_galls_graphs/SVG_files/UNIQUE_OTUS/Venn_Diagrams/venn_diagram.svg"
+
+# Open a new SVG device to save the Venn diagram as an SVG file
+svg(file_path)
+
+# Plot Venn diagram without labels
+venn.plot <- venn.diagram(
+  otus_list,
+  filename = NULL,
+  fill = c("red", "blue", "green", "yellow", "purple"),
+  alpha = 0.5,
+  cat.cex = 0.7,
+  category.names = c("", "", "", "", ""),  # Set category names to empty strings
+  label.col = "black"  # Retain the labels for the overlaps
+)
+
+# Display the Venn diagram
+grid.draw(venn.plot)
+
+# Close the SVG device to save the file
+dev.off()
+
+```
+
+
+### Export data used to make above plot for remaking with other programs:
+```{r}
+# Define the directory where you want to save the CSV files
+output_directory <- "/Users/christopherbivins/Desktop/csv_files_for_galls_graphs/"
+
+# Ensure the directory exists
+if (!dir.exists(output_directory)) {
+  dir.create(output_directory, recursive = TRUE)
+}
+
+# Create a data frame for each group and write to a CSV file
+for (group_name in names(otus_list)) {
+  # Create a data frame from the list of OTUs
+  otus_df <- data.frame(OTU_ID = otus_list[[group_name]])
+  
+  # Define the file path for the CSV file with "unique_OTUs" in the name
+  file_path <- file.path(output_directory, paste0(gsub(" ", "_", group_name), "_unique_OTUs.csv"))
+  
+  # Write the data frame to a CSV file
+  write.csv(otus_df, file = file_path, row.names = FALSE)
+  
+  # Print a message indicating the file was saved
+  cat("Saved:", file_path, "\n")
+}
+
+```
+
+
+## OTU Changes from galled leaves to galls
+### New analysis
+
+## Indicator species analysis
+```{r}
+
+
+# Extract the OTU table and sample data from the phyloseq object
+otu_table_rel_abundance <- as(otu_table(RA_galls_project_physeq), "matrix")
+sample_data_df <- as(sample_data(RA_galls_project_physeq), "data.frame")
+
+# Filter out sample O1-G-5-S164-L001 from both OTU table and sample data
+samples_to_remove <- "O1-G-5-S164-L001"
+otu_table_rel_abundance <- otu_table_rel_abundance[, !(colnames(otu_table_rel_abundance) %in% samples_to_remove)]
+sample_data_df <- sample_data_df[!(rownames(sample_data_df) %in% samples_to_remove), ]
+
+# Check if OTU table is numeric
+if (!is.numeric(otu_table_rel_abundance)) {
+    stop("OTU table is not numeric. Please ensure OTU table contains numeric values.")
+}
+
+# Recheck that the OTU table and sample data are aligned
+otu_table_rel_abundance <- otu_table_rel_abundance[, rownames(sample_data_df)]
+
+# Transpose the OTU table (so that samples are rows and OTUs are columns)
+otu_table_rel_abundance <- t(otu_table_rel_abundance)
+
+# Ensure that the 'Treatment' column is a factor
+sample_data_df$Treatment <- as.factor(sample_data_df$Treatment)
+
+# Perform the indicator species analysis
+indval_result <- multipatt(otu_table_rel_abundance, sample_data_df$Treatment, func = "IndVal.g", control = how(nperm = 999))
+
+# View the summary of the results
+summary(indval_result)
+
+# Extract significant results (p-value < 0.05)
+isa_significant_otus <- indval_result$sign[which(indval_result$sign$p.value < 0.05), ]
+
+
+
+# Move the row names into a new column called OTUID
+isa_significant_otus <- rownames_to_column(isa_significant_otus, var = "OTUID")
+
+
+```
+
+### DESeq2 Analysis (To determine which OTUs significantly increase from galled leaves to galls)
+
+```{r}
+
+
+
+
+# Start of the code
+
+# 1. Incorporate Pairing Information into Sample Metadata
+
+## Extract sample data from the phyloseq object
+sample_data_df <- data.frame(sample_data(galls_project_physeq_updated))
+
+## Ensure sample names are in a column
+sample_data_df$SampleID <- rownames(sample_data_df)
+
+## a. Add PairID to Cynips samples
+# Add PairID to cynips_sample_pairs
+cynips_sample_pairs$PairID <- paste0("Cynips_Pair_", 1:nrow(cynips_sample_pairs))
+
+# Reshape to long format
+cynips_pairs_long <- cynips_sample_pairs %>%
+  pivot_longer(cols = c(SampleName_Gall, SampleName_Leaf),
+               names_to = "SampleType",
+               values_to = "SampleID") %>%
+  mutate(Condition = ifelse(SampleType == "SampleName_Gall", "Gall", "Galled_Leaf"))
+
+# Merge PairID into sample_data_df
+sample_data_df <- sample_data_df %>%
+  left_join(cynips_pairs_long[, c("SampleID", "PairID")], by = "SampleID")
+
+## b. Add PairID to Andricus samples
+# Add PairID to andricus_sample_pairs
+andricus_sample_pairs$PairID <- paste0("Andricus_Pair_", 1:nrow(andricus_sample_pairs))
+
+# Reshape to long format
+andricus_pairs_long <- andricus_sample_pairs %>%
+  pivot_longer(cols = c(SampleName_Gall, SampleName_Leaf),
+               names_to = "SampleType",
+               values_to = "SampleID") %>%
+  mutate(Condition = ifelse(SampleType == "SampleName_Gall", "Gall", "Galled_Leaf"))
+
+# Merge PairID into sample_data_df
+sample_data_df <- sample_data_df %>%
+  left_join(andricus_pairs_long[, c("SampleID", "PairID")], by = "SampleID")
+
+## c. Handle overlapping samples and fill in missing PairID and Condition
+# If a sample is both in Cynips and Andricus, ensure correct PairID and Condition
+# For simplicity, we'll assume there's no overlap; adjust accordingly if there is
+
+# Set the row names of sample_data_df to the SampleID column
+rownames(sample_data_df) <- sample_data_df$SampleID
+
+# Update sample_data in the phyloseq object
+# a. Rename 'Treatment' to 'Condition'
+sample_data_df <- sample_data_df %>%
+  rename(Condition = Treatment)
+
+# b. Combine 'PairID.x' and 'PairID.y' into a single 'PairID' column
+# Use coalesce to handle NA values and prioritize non-NA values
+sample_data_df <- sample_data_df %>%
+  mutate(PairID = coalesce(PairID.x, PairID.y)) %>%
+  select(-PairID.x, -PairID.y)
+
+
+sample_data(galls_project_physeq_updated) <- sample_data(sample_data_df)
+
+# 2. Subset Phyloseq Object for Each Gall Type
+
+## a. For Cynips
+# Extract sample IDs for Cynips analysis
+cynips_sample_ids <- unique(c(cynips_sample_pairs$SampleName_Gall, cynips_sample_pairs$SampleName_Leaf))
+
+# Subset phyloseq object
+cynips_physeq <- prune_samples(cynips_sample_ids, galls_project_physeq_updated)
+
+# Subset OTUs to common_cynips_otus
+cynips_physeq <- prune_taxa(common_cynips_otus, cynips_physeq)
+
+## b. For Andricus
+# Extract sample IDs for Andricus analysis
+andricus_sample_ids <- unique(c(andricus_sample_pairs$SampleName_Gall, andricus_sample_pairs$SampleName_Leaf))
+
+# Subset phyloseq object
+andricus_physeq <- prune_samples(andricus_sample_ids, galls_project_physeq_updated)
+
+# Subset OTUs to common_andricus_otus
+andricus_physeq <- prune_taxa(common_andricus_otus, andricus_physeq)
+
+# 3. Prepare DESeq2 Input Data
+
+## a. Prepare data for Cynips
+# Extract count data and sample data
+counts_cynips <- as(otu_table(cynips_physeq), "matrix")
+sample_data_cynips <- data.frame(sample_data(cynips_physeq))
+
+# Ensure taxa are rows
+if (!taxa_are_rows(cynips_physeq)) {
+  counts_cynips <- t(counts_cynips)
+}
+
+# Ensure sample names match
+all(colnames(counts_cynips) == rownames(sample_data_cynips))  # Should return TRUE
+
+## b. Prepare data for Andricus
+# Extract count data and sample data
+counts_andricus <- as(otu_table(andricus_physeq), "matrix")
+sample_data_andricus <- data.frame(sample_data(andricus_physeq))
+
+# Ensure taxa are rows
+if (!taxa_are_rows(andricus_physeq)) {
+  counts_andricus <- t(counts_andricus)
+}
+
+# Ensure sample names match
+all(colnames(counts_andricus) == rownames(sample_data_andricus))  # Should return TRUE
+
+# 4. Run DESeq2 Analysis
+
+## a. For Cynips
+# Create DESeqDataSet
+dds_cynips <- DESeqDataSetFromMatrix(
+  countData = counts_cynips,
+  colData = sample_data_cynips,
+  design = ~ PairID + Condition
+)
+
+# Filter out rows with low counts (optional but recommended)
+dds_cynips <- dds_cynips[rowSums(counts(dds_cynips)) > 1, ]
+
+# Estimate size factors using 'poscounts' method
+dds_cynips <- estimateSizeFactors(dds_cynips, type = "poscounts")
+
+
+# Run DESeq2 analysis
+dds_cynips <- DESeq(dds_cynips)
+
+
+# Get results comparing Gall vs. Galled_Leaf
+# Get results comparing Cynips_Gall vs. Leaf_galled_by_Cynips
+res_cynips <- results(dds_cynips, contrast = c("Condition", "Cynips_Gall", "Leaf_galled_by_Cynips"))
+
+
+## b. For Andricus
+# Create DESeqDataSet
+dds_andricus <- DESeqDataSetFromMatrix(
+  countData = counts_andricus,
+  colData = sample_data_andricus,
+  design = ~ PairID + Condition
+)
+
+# Filter out rows with low counts (optional but recommended)
+dds_andricus <- dds_andricus[rowSums(counts(dds_andricus)) > 1, ]
+
+# Estimate size factors using 'poscounts' method
+dds_andricus <- estimateSizeFactors(dds_andricus, type = "poscounts")
+
+# Run DESeq2 analysis
+dds_andricus <- DESeq(dds_andricus)
+
+# Get results comparing Gall vs. Galled_Leaf
+# Get results comparing Andricus_Gall vs. Leaf_galled_by_Andricus
+res_andricus <- results(dds_andricus, contrast = c("Condition", "Andricus_Gall", "Leaf_galled_by_Andricus"))
+
+
+# 5. Identify Significantly Increased OTUs
+
+## a. For Cynips
+# Order results by adjusted p-value
+res_cynips_ordered <- res_cynips[order(res_cynips$padj), ]
+
+# Filter for significantly increased OTUs (padj < 0.05 and log2FoldChange > 0)
+sig_otus_cynips <- subset(res_cynips_ordered, padj < 0.05 & log2FoldChange > 0)
+
+# View significant OTUs
+print("Significant OTUs for Cynips:")
+print(sig_otus_cynips)
+
+## b. For Andricus
+# Order results by adjusted p-value
+res_andricus_ordered <- res_andricus[order(res_andricus$padj), ]
+
+# Filter for significantly increased OTUs (padj < 0.05 and log2FoldChange > 0)
+sig_otus_andricus <- subset(res_andricus_ordered, padj < 0.05 & log2FoldChange > 0)
+
+# View significant OTUs
+print("Significant OTUs for Andricus:")
+print(sig_otus_andricus)
+
+# 6. Diagnostic Plots and Result Interpretation
+
+## a. Diagnostic plots for Cynips
+# MA-Plot
+plotMA(res_cynips, main = "Cynips Gall vs. Galled Leaf", ylim = c(-5, 5))
+
+# Dispersion estimates
+plotDispEsts(dds_cynips)
+
+# Histogram of p-values
+hist(res_cynips$pvalue, breaks = 50, main = "P-value Distribution for Cynips", xlab = "P-value")
+
+## b. Diagnostic plots for Andricus
+# MA-Plot
+plotMA(res_andricus, main = "Andricus Gall vs. Galled Leaf", ylim = c(-5, 5))
+
+# Dispersion estimates
+plotDispEsts(dds_andricus)
+
+# Histogram of p-values
+hist(res_andricus$pvalue, breaks = 50, main = "P-value Distribution for Andricus", xlab = "P-value")
+
+# 7. Add Taxonomy Information (if available)
+
+## a. For Cynips
+cynips_significantly_increasing_otus_df <- if (!is.null(tax_table(cynips_physeq, errorIfNULL = FALSE))) {
+  taxonomy_cynips <- as.data.frame(tax_table(cynips_physeq))
+  taxonomy_cynips$OTU <- rownames(taxonomy_cynips)
+  sig_otus_cynips_df <- as.data.frame(sig_otus_cynips)
+  sig_otus_cynips_df$OTU <- rownames(sig_otus_cynips_df)
+  sig_otus_cynips_tax <- merge(sig_otus_cynips_df, taxonomy_cynips, by = "OTU")
+  print("Significant OTUs for Cynips with Taxonomy:")
+  print(sig_otus_cynips_tax)
+}
+
+## b. For Andricus
+andricus_significantly_increasing_otus_df <- if (!is.null(tax_table(andricus_physeq, errorIfNULL = FALSE))) {
+  taxonomy_andricus <- as.data.frame(tax_table(andricus_physeq))
+  taxonomy_andricus$OTU <- rownames(taxonomy_andricus)
+  sig_otus_andricus_df <- as.data.frame(sig_otus_andricus)
+  sig_otus_andricus_df$OTU <- rownames(sig_otus_andricus_df)
+  sig_otus_andricus_tax <- merge(sig_otus_andricus_df, taxonomy_andricus, by = "OTU")
+  print("Significant OTUs for Andricus with Taxonomy:")
+  print(sig_otus_andricus_tax)
+}
+
+```
+
+### Calculate log2fold changes for common OTUs between galled leaves and galls
+```{r}
+# Define a function to calculate average relative abundance for a given group
+calculate_average_relative_abundance <- function(group, galls_project_physeq_updated) {
+  # Extract sample data to identify groups
+  sample_data_df <- as.data.frame(as(sample_data(galls_project_physeq_updated), "data.frame"))
+  sample_data_df$SampleID <- rownames(sample_data_df)
+  
+  # Subset the samples that belong to the specified group
+  group_samples <- sample_data_df %>%
+    filter(Condition == group) %>%
+    pull(SampleID)
+  
+  # Subset the OTU table for these samples
+  otu_table <- as.data.frame(otu_table(galls_project_physeq_updated))
+  group_otu_table <- otu_table[, group_samples, drop = FALSE]
+  
+  # Calculate relative abundance for each OTU in each sample
+  relative_abundance_table <- sweep(group_otu_table, 2, colSums(group_otu_table), FUN = "/")
+  
+  # Calculate the average relative abundance of each OTU across these samples
+  average_relative_abundance <- rowMeans(relative_abundance_table, na.rm = TRUE)
+  
+  return(average_relative_abundance)
+}
+
+# Calculate average relative abundances for each group
+leaf_galled_by_cynips_avg <- calculate_average_relative_abundance("Leaf_galled_by_Cynips", galls_project_physeq_updated)
+cynips_galls_avg <- calculate_average_relative_abundance("Cynips_Gall", galls_project_physeq_updated)
+leaf_galled_by_andricus_avg <- calculate_average_relative_abundance("Leaf_galled_by_Andricus", galls_project_physeq_updated)
+andricus_galls_avg <- calculate_average_relative_abundance("Andricus_Gall", galls_project_physeq_updated)
+
+# Calculate the differences in relative abundance for ALL OTUs
+cynips_diff_all <- (cynips_galls_avg - leaf_galled_by_cynips_avg) / leaf_galled_by_cynips_avg * 100
+andricus_diff_all <- (andricus_galls_avg - leaf_galled_by_andricus_avg) / leaf_galled_by_andricus_avg * 100
+
+# Create data frames for ALL OTUs
+cynips_diff_all_df <- data.frame(
+  OTU = names(cynips_diff_all),
+  PercentageChange = cynips_diff_all,
+  Taxonomy = apply(taxonomy_table[names(cynips_diff_all), ], 1, function(row) paste(na.omit(row), collapse = "; "))
+)
+
+andricus_diff_all_df <- data.frame(
+  OTU = names(andricus_diff_all),
+  PercentageChange = andricus_diff_all,
+  Taxonomy = apply(taxonomy_table[names(andricus_diff_all), ], 1, function(row) paste(na.omit(row), collapse = "; "))
+)
+
+
+
+
+#### Let's make sure we aren't including OTUs that are present in one sample type but not the other
+
+
+# Identify OTUs present in Cynips galls
+otus_in_cynips_galls <- names(cynips_galls_avg[cynips_galls_avg > 0])
+
+# Identify OTUs present in leaves galled by Cynips
+otus_in_leaves_galled_by_cynips <- names(leaf_galled_by_cynips_avg[leaf_galled_by_cynips_avg > 0])
+
+# Identify OTUs present in Andricus galls
+otus_in_andricus_galls <- names(andricus_galls_avg[andricus_galls_avg > 0])
+
+# Identify OTUs present in leaves galled by Andricus
+otus_in_leaves_galled_by_andricus <- names(leaf_galled_by_andricus_avg[leaf_galled_by_andricus_avg > 0])
+
+
+# Identify OTUs present in both Cynips galls and leaves galled by Cynips
+common_cynips_otus <- intersect(otus_in_cynips_galls, otus_in_leaves_galled_by_cynips)
+
+# Identify OTUs present in both Andricus galls and leaves galled by Andricus
+common_andricus_otus <- intersect(otus_in_andricus_galls, otus_in_leaves_galled_by_andricus)
+
+# OTUs present in leaves galled by Cynips but absent in Cynips galls
+otus_in_leaves_but_not_cynips_galls <- setdiff(otus_in_leaves_galled_by_cynips, otus_in_cynips_galls)
+
+# OTUs present in Cynips galls but absent in leaves galled by Cynips
+otus_in_cynips_galls_but_not_leaves <- setdiff(otus_in_cynips_galls, otus_in_leaves_galled_by_cynips)
+
+# OTUs present in leaves galled by Andricus but absent in Andricus galls
+otus_in_leaves_but_not_andricus_galls <- setdiff(otus_in_leaves_galled_by_andricus, otus_in_andricus_galls)
+
+# OTUs present in Andricus galls but absent in leaves galled by Andricus
+otus_in_andricus_galls_but_not_leaves <- setdiff(otus_in_andricus_galls, otus_in_leaves_galled_by_andricus)
+
+# Count the number of OTUs in each category
+num_otus_in_leaves_but_not_cynips_galls <- length(otus_in_leaves_but_not_cynips_galls)
+num_otus_in_cynips_galls_but_not_leaves <- length(otus_in_cynips_galls_but_not_leaves)
+num_otus_in_leaves_but_not_andricus_galls <- length(otus_in_leaves_but_not_andricus_galls)
+num_otus_in_andricus_galls_but_not_leaves <- length(otus_in_andricus_galls_but_not_leaves)
+
+
+# Create a data frame with the OTU counts
+otu_counts_df <- data.frame(
+  Category = c(
+    "Cynips: Leaves > Galls",
+    "Cynips: Galls > Leaves",
+    "Andricus: Leaves > Galls",
+    "Andricus: Galls > Leaves"
+  ),
+  OTU_Count = c(
+    num_otus_in_leaves_but_not_cynips_galls,
+    num_otus_in_cynips_galls_but_not_leaves,
+    num_otus_in_leaves_but_not_andricus_galls,
+    num_otus_in_andricus_galls_but_not_leaves
+  )
+)
+
+# Plot the OTU counts as a bar plot
+
+
+ggplot(otu_counts_df, aes(x = Category, y = OTU_Count, fill = Category)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Number of OTUs Present in One Sample Type but Absent in the Other",
+       x = "Category",
+       y = "Number of OTUs") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme(legend.position = "none")  # Remove the legend since categories are shown on the x-axis
+
+
+#### Calculate Log2Fold changes from galled leaves to galls
+
+
+# Filter the percentage change data for Cynips to include only common OTUs
+cynips_diff_filtered <- cynips_diff_all_df %>%
+  filter(OTU %in% common_cynips_otus)
+
+# Filter the percentage change data for Andricus to include only common OTUs
+andricus_diff_filtered <- andricus_diff_all_df %>%
+  filter(OTU %in% common_andricus_otus)
+
+# Calculate log2 fold change for Cynips
+cynips_diff_filtered$Log2FoldChange <- log2(cynips_galls_avg[common_cynips_otus] / leaf_galled_by_cynips_avg[common_cynips_otus])
+
+# Calculate log2 fold change for Andricus samples
+andricus_diff_filtered$Log2FoldChange <- log2(andricus_galls_avg[common_andricus_otus] / leaf_galled_by_andricus_avg[common_andricus_otus])
+
+
+### Create dataframes from the log2fold change analysis that combine OTU ID with log2fold change values and taxonomy and primary lifestyle info, ranked from greatest log2fold change to lowest log2fold change so that OTUs with large increases or decreases from galled leaves to galls can quickly be identified
+
+
+# Calculate log2 fold change for Cynips and Andricus samples
+cynips_diff_filtered$Log2FoldChange <- log2(cynips_galls_avg[common_cynips_otus] / leaf_galled_by_cynips_avg[common_cynips_otus])
+andricus_diff_filtered$Log2FoldChange <- log2(andricus_galls_avg[common_andricus_otus] / leaf_galled_by_andricus_avg[common_andricus_otus])
+
+# Use only the guild_table for merging as it contains all needed columns (including taxonomy)
+# For Cynips
+cynips_log2foldchange_df <- cynips_diff_filtered %>%
+  left_join(guild_table, by = c("OTU" = "OTU_ID")) %>%
+  arrange(desc(Log2FoldChange)) %>%
+  select(OTU_ID = OTU, Log2FoldChange, Kingdom, Phylum, Class, Order, Family, Genus, Species, primary_lifestyle)
+
+# For Andricus
+andricus_log2foldchange_df <- andricus_diff_filtered %>%
+  left_join(guild_table, by = c("OTU" = "OTU_ID")) %>%
+  arrange(desc(Log2FoldChange)) %>%
+  select(OTU_ID = OTU, Log2FoldChange, Kingdom, Phylum, Class, Order, Family, Genus, Species, primary_lifestyle)
+
+# View the first few rows of the Cynips dataframe
+head(cynips_log2foldchange_df)
+
+# View the first few rows of the Andricus dataframe
+head(andricus_log2foldchange_df)
+```
+
+
+### Export dataframes for plotting log2fold changes, indicator species analysis, and DESeq2 results with other sofwtware:
+
+```{r}
+### Dataframes to export: 
+# 1. cynips_log2foldchange_df
+# 2. andricus_log2foldchange_df
+# 3. isa_significant_otus
+# 4. cynips_significantly_increasing_otus_df
+# 5. andricus_significantly_increasing_otus_df
+
+# Define the path to the directory
+output_dir <- "/Users/christopherbivins/Desktop/csv_files_for_galls_graphs/Log2Fold_Increases/"
+
+# Export each dataframe as a CSV file
+write.csv(cynips_log2foldchange_df, file = paste0(output_dir, "cynips_log2foldchange_df.csv"), row.names = FALSE)
+write.csv(andricus_log2foldchange_df, file = paste0(output_dir, "andricus_log2foldchange_df.csv"), row.names = FALSE)
+write.csv(isa_significant_otus, file = paste0(output_dir, "isa_significant_otus.csv"), row.names = FALSE)
+write.csv(cynips_significantly_increasing_otus_df, file = paste0(output_dir, "cynips_significantly_increasing_otus_df.csv"), row.names = FALSE)
+write.csv(andricus_significantly_increasing_otus_df, file = paste0(output_dir, "andricus_significantly_increasing_otus_df.csv"), row.names = FALSE)
+
+```
+
