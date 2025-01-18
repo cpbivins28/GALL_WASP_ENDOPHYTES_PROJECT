@@ -203,7 +203,7 @@ print(sample_names(galls_project_physeq))
 ```
 
 
-### Remove the samples with "-R-" in their name - these are the replicate samples that were done with Regular PCR - everything else was made with nested PCR 
+### Remove the samples with "-R-" in their name
 
 ```{r}
 # Function to remove samples with "-R-" in their name
