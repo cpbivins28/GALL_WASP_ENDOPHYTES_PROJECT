@@ -1,0 +1,82 @@
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# Load data
+df = pd.read_csv("/Users/cbivins/Desktop/Gall_Project_Neater/Normalized_Analysis/Alpha_Diversity/alpha_diversity_normalized_for_python.csv")
+
+# Updated treatment order
+order = [
+    'Leaf_galled_by_Andricus',   # Leaves with saucer galls
+    'Andricus_Gall',             # Saucer galls
+    'Leaf_galled_by_Cynips',     # Leaves with urchin galls
+    'Cynips_Gall',               # Urchin galls
+    'Ungalled_leaf'              # Ungalled leaves
+]
+
+# Hex color palette mapped to treatments
+hex_colors = {
+    'Leaf_galled_by_Andricus': '#fdb462',
+    'Andricus_Gall': '#fdb462',
+    'Leaf_galled_by_Cynips': '#fccde5',
+    'Cynips_Gall': '#fccde5',
+    'Ungalled_leaf': '#80b1d3'
+}
+
+# Output directory
+outdir = "/Users/cbivins/Desktop/Gall_Project_Neater/Normalized_Analysis/Alpha_Diversity"
+
+# Set style with no gridlines
+sns.set_style("white")
+jitter = 0.15
+
+# ---------- Richness ----------
+plt.figure(figsize=(8,6))
+ax = sns.stripplot(data=df, x='Treatment', y='Richness', order=order,
+                   palette=hex_colors, size=4, jitter=jitter, zorder=1)
+sns.boxplot(data=df, x='Treatment', y='Richness', order=order,
+            showcaps=True, boxprops={'facecolor':'none'},
+            showfliers=False, whiskerprops={'linewidth':2}, zorder=2)
+ax.set_title("Rarefied Richness (1500 reads)")
+ax.set_xticklabels(ax.get_xticklabels(), rotation=45)
+ax.set_ylabel("Richness")
+ax.set_xlabel("")
+ax.grid(False)
+sns.despine()
+plt.tight_layout()
+plt.savefig(f"{outdir}/richness_rarefied_1500.svg")
+plt.close()
+
+# ---------- Shannon ----------
+plt.figure(figsize=(8,6))
+ax = sns.stripplot(data=df, x='Treatment', y='Shannon', order=order,
+                   palette=hex_colors, size=4, jitter=jitter, zorder=1)
+sns.boxplot(data=df, x='Treatment', y='Shannon', order=order,
+            showcaps=True, boxprops={'facecolor':'none'},
+            showfliers=False, whiskerprops={'linewidth':2}, zorder=2)
+ax.set_title("Rarefied Shannon Diversity (1500 reads)")
+ax.set_xticklabels(ax.get_xticklabels(), rotation=45)
+ax.set_ylabel("Shannon Diversity")
+ax.set_xlabel("")
+ax.grid(False)
+sns.despine()
+plt.tight_layout()
+plt.savefig(f"{outdir}/shannon_rarefied_1500.svg")
+plt.close()
+
+# ---------- Simpson ----------
+plt.figure(figsize=(8,6))
+ax = sns.stripplot(data=df, x='Treatment', y='Simpson', order=order,
+                   palette=hex_colors, size=4, jitter=jitter, zorder=1)
+sns.boxplot(data=df, x='Treatment', y='Simpson', order=order,
+            showcaps=True, boxprops={'facecolor':'none'},
+            showfliers=False, whiskerprops={'linewidth':2}, zorder=2)
+ax.set_title("Rarefied Simpson Diversity (1500 reads)")
+ax.set_xticklabels(ax.get_xticklabels(), rotation=45)
+ax.set_ylabel("Simpson Diversity")
+ax.set_xlabel("")
+ax.grid(False)
+sns.despine()
+plt.tight_layout()
+plt.savefig(f"{outdir}/simpson_rarefied_1500.svg")
+plt.close()
