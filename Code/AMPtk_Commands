@@ -1,0 +1,15 @@
+## 1 - (pre-processing) 
+amptk illumina -i /home/cbivins/data/oak_endophytes/trimmomatic_final_output -o ITS -f ITS1-F -r ITS2 -l 350 -p on --min_len 150 --reads paired --rescue_forward on --require_primer off --cleanup
+
+## 2 - (cluster) - Clusters sequences into OTUs 
+amptk cluster -i ITS.demux.fq.gz -o clusterITS --uchime_ref ITS
+
+## 3 (filter OTUs) - Filters out low abundance OTUs
+amptk filter -i clusterITS.otu_table.txt -f clusterITS.cluster.otus.fa -o filterITS -p 0.005 --min_reads_otu 10
+
+## 4 (assign taxonomy) - Assigns taxonomy to OTUs
+amptk install -i ITS
+
+amptk taxonomy -i filterITS.final.txt -f filterITS.filtered.otus.fa -o taxonomyITS -m ITS.mapping_file.txt -d ITS1 --tax_filter Fungi 
+
+# Step 3 - Import BIOM file with taxonomy into R
