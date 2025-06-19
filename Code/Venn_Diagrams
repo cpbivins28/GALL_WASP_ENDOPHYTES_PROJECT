@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""
+Generate Venn diagrams of unique / shared OTUs
+Author: ChatGPT
+"""
+
+# -----------------------------------------------------
+# 0. Install required libraries if missing
+# -----------------------------------------------------
+import subprocess, sys
+def ensure(pkg):
+    try:
+        __import__(pkg)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+for lib in ("pandas", "matplotlib", "matplotlib-venn"):
+    ensure(lib)
+
+# -----------------------------------------------------
+# 1. Imports and paths
+# -----------------------------------------------------
+import os, pandas as pd, matplotlib.pyplot as plt
+from matplotlib_venn import venn2, venn3
+
+otu_fp = "/Users/cbivins/Desktop/Gall_Project_Neater/Normalized_Analysis/rarefied_OTU_table_1500.csv"
+meta_fp = "/Users/cbivins/Desktop/Gall_Project_Neater/Relative_Abundance/Gall_project_metadata.csv"
+out_dir = "/Users/cbivins/Desktop/Gall_Project_Neater/Unique_OTUs/New"
+os.makedirs(out_dir, exist_ok=True)
+
+# -----------------------------------------------------
+# 2. Load data
+# -----------------------------------------------------
+otu = pd.read_csv(otu_fp, index_col=0)
+meta = pd.read_csv(meta_fp)
+
+meta.columns = [c.strip() for c in meta.columns]
+if {"Sample_ID", "Treatment"} - set(meta.columns):
+    sys.exit("Metadata must contain Sample_ID and Treatment columns")
+
+# -----------------------------------------------------
+# 3. Filter and align
+# -----------------------------------------------------
+otu = otu.loc[otu.sum(axis=1) > 0]          # drop empty samples
+meta = meta[meta.Sample_ID.isin(otu.index)] # keep only samples present in OTU table
+common = sorted(set(otu.index) & set(meta.Sample_ID))
+otu  = otu.loc[common]
+meta = meta.set_index("Sample_ID").loc[common]
+
+# -----------------------------------------------------
+# 4. OTU sets per treatment
+# -----------------------------------------------------
+otu_sets = {
+    trt: set(((otu.loc[meta.Treatment == trt] > 0).any()).pipe(lambda s: s[s].index))
+    for trt in meta.Treatment.unique()
+}
+
+# -----------------------------------------------------
+# 5. Comparison specs
+# -----------------------------------------------------
+venn3_spec = {
+    "figure4A": ["Cynips_Gall", "Leaf_galled_by_Cynips", "Ungalled_leaf"],
+    "figure4B": ["Andricus_Gall", "Leaf_galled_by_Andricus", "Ungalled_leaf"],
+}
+venn2_spec = {
+    "figure5A": ["Leaf_galled_by_Andricus", "Andricus_Gall"],
+    "figure5B": ["Leaf_galled_by_Cynips", "Cynips_Gall"],
+    "figure5C": ["Leaf_galled_by_Andricus", "Ungalled_leaf"],
+    "figure5D": ["Leaf_galled_by_Cynips", "Ungalled_leaf"],
+    "figure5E": ["Leaf_galled_by_Andricus", "Leaf_galled_by_Cynips"],
+    "figure5F": ["Andricus_Gall", "Cynips_Gall"],
+}
+
+def tidy(name_list): return "_vs_".join(name_list).replace(" ", "_")
+
+# -----------------------------------------------------
+# 6. Plot helpers (alpha fixed to 1)
+# -----------------------------------------------------
+def make_venn2(key, groups):
+    s1, s2 = (otu_sets[g] for g in groups)
+    plt.figure(figsize=(4,4))
+    v = venn2([s1, s2], set_labels=groups)
+    for p in v.patches: 
+        if p: p.set_alpha(1)
+    plt.title(key)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{key}__{tidy(groups)}.svg"), format="svg")
+    plt.close()
+
+def make_venn3(key, groups):
+    s1, s2, s3 = (otu_sets[g] for g in groups)
+    plt.figure(figsize=(4,4))
+    v = venn3([s1, s2, s3], set_labels=groups)
+    for p in v.patches: 
+        if p: p.set_alpha(1)
+    plt.title(key)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{key}__{tidy(groups)}.svg"), format="svg")
+    plt.close()
+
+# -----------------------------------------------------
+# 7. Generate diagrams
+# -----------------------------------------------------
+for k, g in venn3_spec.items(): make_venn3(k, g)
+for k, g in venn2_spec.items(): make_venn2(k, g)
+
+print(f"Done. SVGs in {out_dir}")
+
